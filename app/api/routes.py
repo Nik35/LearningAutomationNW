@@ -264,6 +264,16 @@ async def _handle_request(
         device_id=target_device,
     )
 
+    # Increment queue depth counters so admission checks see live depth.
+    # These are best-effort — a Redis failure here does not block the 202.
+    try:
+        pipe = redis.pipeline()
+        pipe.incr("queue_depth:global")
+        pipe.incr(f"queue_depth:{target_device}")
+        await pipe.execute()
+    except Exception:
+        pass
+
     request_total.labels(action=action, status="accepted").inc()
     log.info("api.request_queued", new_request_id=str(new_row.request_id))
 

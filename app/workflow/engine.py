@@ -102,6 +102,7 @@ class WorkflowEngine:
         self._steps_delete = steps_for_delete
         self._remediation_repo = remediation_repo
         self._notification_sender = notification_sender
+        self._redis_client: Any = None  # injected by caller for queue depth tracking
 
     async def execute(self, request_id: uuid.UUID, worker_id: str, pod_id: str) -> None:
         """
@@ -286,6 +287,7 @@ class WorkflowEngine:
         _transition(conn, request.request_id, Status.VERIFYING, Status.COMPLETED,
                     reason="all_steps_succeeded", actor="engine", trans_repo=trans_repo)
         log.info("workflow.completed", fqdn=fqdn, action=action)
+        await self._decrement_queue_depth(device_id)
 
     async def _rollback(
         self,
@@ -333,6 +335,7 @@ class WorkflowEngine:
         _transition(conn, request.request_id, Status.ROLLING_BACK, Status.ROLLED_BACK,
                     reason="all_compensations_succeeded", actor="engine", trans_repo=trans_repo)
         log.info("workflow.rolled_back", fqdn=request.wip_fqdn)
+        await self._decrement_queue_depth(request.target_device)
 
     async def _run_heartbeat(
         self,
@@ -348,6 +351,17 @@ class WorkflowEngine:
                 await self._semaphore.renew(worker_id, int(self._heartbeat_interval * 3))
             except Exception as exc:
                 log.warning("workflow.heartbeat_error", error=str(exc))
+
+    async def _decrement_queue_depth(self, device_id: str) -> None:
+        """Best-effort decrement — failure does not block completion."""
+        try:
+            if hasattr(self, "_redis_client") and self._redis_client is not None:
+                pipe = self._redis_client.pipeline()
+                pipe.decr("queue_depth:global")
+                pipe.decr(f"queue_depth:{device_id}")
+                await pipe.execute()
+        except Exception as exc:
+            log.warning("workflow.queue_depth_decrement_failed", error=str(exc))
 
     async def _notify(self, request: Any, message: str) -> None:
         if self._notification_sender:

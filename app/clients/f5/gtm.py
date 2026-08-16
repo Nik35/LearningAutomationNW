@@ -33,13 +33,18 @@ The partition separator in iControl REST URLs is ``~``::
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import httpx
 
 from app.clients.f5.auth import F5TokenManager
 from app.clients.f5.session import F5Session
+
+if TYPE_CHECKING:
+    from app.coordination.breaker import DeviceCircuitBreaker
+    from app.coordination.ratelimit import DeviceTokenBucket
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -210,9 +215,17 @@ class F5GTMClient:
         The ``F5TokenManager`` for the target device.
     """
 
-    def __init__(self, session: F5Session, token_manager: F5TokenManager) -> None:
+    def __init__(
+        self,
+        session: F5Session,
+        token_manager: F5TokenManager,
+        token_bucket: "DeviceTokenBucket | None" = None,
+        circuit_breaker: "DeviceCircuitBreaker | None" = None,
+    ) -> None:
         self._session = session
         self._token_manager = token_manager
+        self._token_bucket = token_bucket      # P-2/P-3: awaiting T-0.7
+        self._circuit_breaker = circuit_breaker  # P-10: awaiting T-0.6/T-0.7
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -223,6 +236,24 @@ class F5GTMClient:
         return await self._token_manager.inject_auth(
             {"Content-Type": "application/json", "Accept": "application/json"}
         )
+
+    async def _consume_token(self) -> None:
+        """Consume one token from the rate-limit bucket before each F5 call."""
+        if self._token_bucket is not None:
+            allowed = await self._token_bucket.consume(1)
+            if not allowed:
+                raise F5Error("Rate limit bucket exhausted — request rejected before F5 call")
+
+    async def _record_outcome(self, latency_ms: float, *, timed_out: bool = False, failed: bool = False) -> None:
+        """Feed call outcome into the circuit breaker."""
+        if self._circuit_breaker is None:
+            return
+        if timed_out:
+            await self._circuit_breaker.record_timeout()
+        elif failed:
+            await self._circuit_breaker.record_failure(latency_ms)
+        else:
+            await self._circuit_breaker.record_success(latency_ms)
 
     async def _get(self, path: str) -> dict | None:  # type: ignore[type-arg]
         """
@@ -237,13 +268,20 @@ class F5GTMClient:
         F5Error
             On any other non-200/404 response.
         """
+        await self._consume_token()
         headers = await self._authed_headers()
+        t0 = time.monotonic()
         try:
             response = await self._session.request("GET", path, headers=headers)
         except httpx.TimeoutException as exc:
+            await self._record_outcome(0, timed_out=True)
             raise F5TimeoutError(
                 f"GET {path} timed out: {exc}", operation="GET", path=path
             ) from exc
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        is_error = response.status_code >= 500
+        await self._record_outcome(latency_ms, failed=is_error)
 
         if response.status_code == 404:
             return None
@@ -260,15 +298,22 @@ class F5GTMClient:
 
     async def _post(self, path: str, payload: dict) -> dict:  # type: ignore[type-arg]
         """POST ``payload`` to ``path``.  Returns the created resource body."""
+        await self._consume_token()
         headers = await self._authed_headers()
+        t0 = time.monotonic()
         try:
             response = await self._session.request(
                 "POST", path, headers=headers, json=payload
             )
         except httpx.TimeoutException as exc:
+            await self._record_outcome(0, timed_out=True)
             raise F5TimeoutError(
                 f"POST {path} timed out: {exc}", operation="POST", path=path
             ) from exc
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        is_error = response.status_code >= 500
+        await self._record_outcome(latency_ms, failed=is_error)
 
         if response.status_code == 409:
             raise F5ConflictError(
@@ -287,15 +332,21 @@ class F5GTMClient:
 
     async def _patch(self, path: str, payload: dict) -> dict:  # type: ignore[type-arg]
         """PATCH ``payload`` onto ``path``.  Returns the updated resource body."""
+        await self._consume_token()
         headers = await self._authed_headers()
+        t0 = time.monotonic()
         try:
             response = await self._session.request(
                 "PATCH", path, headers=headers, json=payload
             )
         except httpx.TimeoutException as exc:
+            await self._record_outcome(0, timed_out=True)
             raise F5TimeoutError(
                 f"PATCH {path} timed out: {exc}", operation="PATCH", path=path
             ) from exc
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        await self._record_outcome(latency_ms, failed=response.status_code >= 500)
 
         if 500 <= response.status_code < 600:
             raise F5ServerError(
@@ -310,15 +361,21 @@ class F5GTMClient:
 
     async def _put(self, path: str, payload: dict) -> dict:  # type: ignore[type-arg]
         """PUT ``payload`` to ``path``.  Returns the updated resource body."""
+        await self._consume_token()
         headers = await self._authed_headers()
+        t0 = time.monotonic()
         try:
             response = await self._session.request(
                 "PUT", path, headers=headers, json=payload
             )
         except httpx.TimeoutException as exc:
+            await self._record_outcome(0, timed_out=True)
             raise F5TimeoutError(
                 f"PUT {path} timed out: {exc}", operation="PUT", path=path
             ) from exc
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        await self._record_outcome(latency_ms, failed=response.status_code >= 500)
 
         if 500 <= response.status_code < 600:
             raise F5ServerError(
@@ -338,13 +395,19 @@ class F5GTMClient:
         Returns ``None`` on 200/204.  Does NOT raise on 404 — callers handle
         that via the return value of ``delete_*`` methods.
         """
+        await self._consume_token()
         headers = await self._authed_headers()
+        t0 = time.monotonic()
         try:
             response = await self._session.request("DELETE", path, headers=headers)
         except httpx.TimeoutException as exc:
+            await self._record_outcome(0, timed_out=True)
             raise F5TimeoutError(
                 f"DELETE {path} timed out: {exc}", operation="DELETE", path=path
             ) from exc
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        await self._record_outcome(latency_ms, failed=response.status_code >= 500)
 
         if response.status_code == 404:
             raise F5NotFoundError(f"DELETE {path}: resource not found")

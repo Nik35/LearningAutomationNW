@@ -61,7 +61,20 @@ def _build_engine_for_device(device_id: str) -> object:
         session=f5_session,
         login_provider_name=settings.F5_LOGIN_PROVIDER_NAME,  # TACACS+ source name
     )
-    f5_client = F5GTMClient(session=f5_session, token_manager=f5_token_mgr)
+    from app.coordination.ratelimit import DeviceTokenBucket
+
+    f5_token_bucket = DeviceTokenBucket(
+        redis_client=redis_client,
+        device_id=device_id,
+        capacity=settings.P2_TOKEN_BUCKET_SIZE,      # TODO: awaiting T-0.7
+        refill_rate=settings.P3_TOKEN_REFILL_RATE,   # TODO: awaiting T-0.7
+    )
+    f5_client = F5GTMClient(
+        session=f5_session,
+        token_manager=f5_token_mgr,
+        token_bucket=f5_token_bucket,
+        circuit_breaker=breaker,
+    )
 
     # Infoblox client
     ib_session = InfobloxSession(
@@ -117,7 +130,7 @@ def _build_engine_for_device(device_id: str) -> object:
     def db_conn_factory() -> pyodbc.Connection:
         return pyodbc.connect(settings.DB_CONNECTION_STRING)
 
-    return WorkflowEngine(
+    engine = WorkflowEngine(
         db_conn_factory=db_conn_factory,
         semaphore=semaphore,
         breaker=breaker,
@@ -127,6 +140,8 @@ def _build_engine_for_device(device_id: str) -> object:
         steps_for_delete=steps_delete,
         semaphore_timeout_seconds=settings.P4_SEMAPHORE_ACQUIRE_TIMEOUT,    # TODO: awaiting T-0.x
     )
+    engine._redis_client = redis_client  # injected for queue depth decrement on completion
+    return engine
 
 
 @celery_app.task(name="app.tasks.workflows.run_gtm_workflow", bind=True)
