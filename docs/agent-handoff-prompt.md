@@ -177,6 +177,301 @@ NEEDS_ATTENTION is terminal. Nothing automatic exits it. Entry writes to the `no
 
 ---
 
+## How the 4 protection layers work — with code examples
+
+This is the most important section for a next agent to understand. All 4 layers are already built in `app/coordination/`. The wiring across the request lifecycle is what a next agent needs to complete and verify.
+
+---
+
+### The 4 layers and what each one protects
+
+Think of a request going through a funnel. The cheapest checks happen first (admission), the most expensive happen last (inside the worker). This is deliberate — you don't spend a semaphore slot on a request you were going to reject anyway.
+
+```
+API receives POST
+       │
+       ▼
+[Layer 1] Queue depth check  ← cheapest: just reads two Redis integers
+       │  "are we full globally and for this device?"
+       │  NO → 503 immediately
+       │
+       ▼
+[Layer 2] Circuit breaker check  ← "is this device known to be failing right now?"
+       │  OPEN → 503 immediately (park in QUEUED if already accepted)
+       │
+       ▼
+  202 returned, request_id enqueued to Celery
+       │
+       ▼
+  Celery worker picks up the task
+       │
+       ▼
+[Layer 3] Semaphore acquire  ← "is there a free concurrency slot for this device?"
+       │  TIMEOUT → revert to QUEUED, re-enqueue with backoff
+       │  ACQUIRED → hold slot for entire workflow duration
+       │
+       ▼
+  For each F5 call inside a step:
+       │
+       ▼
+[Layer 4] Token bucket consume  ← "have we sent too many requests to this F5 too fast?"
+          EMPTY → raise F5Error immediately (caught by step, triggers rollback)
+          OK → proceed with HTTP call
+```
+
+---
+
+### Layer 1 — Queue depth counter (Redis INCR/DECR)
+
+**What it does:** Tracks how many requests are currently queued or running, globally and per device.
+
+**Where it lives:**
+- Increment: `app/api/routes.py` — after a request is accepted and enqueued
+- Decrement: `app/workflow/engine.py::_decrement_queue_depth()` — when a request reaches COMPLETED or ROLLED_BACK
+- Read: `app/api/admission.py` — in the admission check
+
+**Code — increment on accept (routes.py, after `.delay()`):**
+```python
+try:
+    pipe = redis.pipeline()
+    pipe.incr("queue_depth:global")
+    pipe.incr(f"queue_depth:{target_device}")
+    await pipe.execute()
+except Exception:
+    pass  # best-effort; don't block the 202
+```
+
+**Code — decrement on terminal state (engine.py):**
+```python
+async def _decrement_queue_depth(self, device_id: str) -> None:
+    try:
+        if self._redis_client is not None:
+            pipe = self._redis_client.pipeline()
+            pipe.decr("queue_depth:global")
+            pipe.decr(f"queue_depth:{device_id}")
+            await pipe.execute()
+    except Exception as exc:
+        log.warning("workflow.queue_depth_decrement_failed", error=str(exc))
+```
+
+**Code — read in admission (admission.py):**
+```python
+global_depth = int(await redis_client.get("queue_depth:global") or 0)
+device_depth = int(await redis_client.get(f"queue_depth:{target_device}") or 0)
+if global_depth >= global_queue_limit:     # P-7
+    return AdmissionResult(allowed=False, status_code=503, ...)
+if device_depth >= device_queue_limit:     # P-8
+    return AdmissionResult(allowed=False, status_code=503, ...)
+```
+
+**Why best-effort on INCR but not on DECR?** The INCR happens at 202-return time when latency matters. If Redis is down at that point, the request was already written to DB and enqueued to Celery — not incrementing the counter is acceptable because the next 503 won't cause data loss. The DECR is also best-effort but lives in a `finally`-equivalent path in the worker.
+
+---
+
+### Layer 2 — Circuit breaker (sliding window, Redis state)
+
+**What it does:** Detects when an F5 device is consistently failing and stops sending it more work. An open breaker causes new requests to get 503 at admission rather than being queued to fail.
+
+**Three signals that trip the breaker (all configurable as P-10 parameters):**
+- Error rate in a sliding window exceeds threshold (e.g. >20% failures in last 60s)
+- p95 latency exceeds threshold (e.g. p95 > 5000ms in last 60s)
+- N consecutive timeouts (e.g. 3 in a row)
+
+**Three states:**
+- `CLOSED` = normal, requests flow through
+- `OPEN` = device known-bad, new requests get 503 immediately
+- `HALF_OPEN` = one probe request allowed through; if it succeeds → CLOSED, fails → OPEN again
+
+**Where it lives:**
+- State machine: `app/coordination/breaker.py` + `app/coordination/scripts/breaker_record.lua`
+- Admission check: `app/api/admission.py` calls `breaker.peek_state()`
+- Outcome recording: `app/clients/f5/gtm.py` calls `breaker.record_success/failure/timeout()` after every HTTP call
+
+**Code — how the F5 client records outcomes (gtm.py):**
+```python
+async def _get(self, path: str) -> dict:
+    await self._consume_token()          # Layer 4 first
+    t0 = time.monotonic()
+    try:
+        response = await self._session.get(path, token=await self._token_manager.get_token())
+        latency_ms = (time.monotonic() - t0) * 1000
+        await self._record_outcome(latency_ms)     # success
+        return response
+    except asyncio.TimeoutError:
+        latency_ms = (time.monotonic() - t0) * 1000
+        await self._record_outcome(latency_ms, timed_out=True)
+        raise F5TimeoutError(...)
+    except Exception:
+        latency_ms = (time.monotonic() - t0) * 1000
+        await self._record_outcome(latency_ms, failed=True)
+        raise
+
+async def _record_outcome(self, latency_ms, *, timed_out=False, failed=False):
+    if self._circuit_breaker is None:
+        return
+    if timed_out:
+        await self._circuit_breaker.record_timeout()
+    elif failed:
+        await self._circuit_breaker.record_failure(latency_ms)
+    else:
+        await self._circuit_breaker.record_success(latency_ms)
+```
+
+**Why cross-pod state in Redis?** We have 4 pods across 2 DCs. If one pod sees an F5 device failing and opens its local breaker, the other 3 pods don't know. They keep sending requests to the failing device. By keeping breaker state in Redis, all pods see the same state within one poll interval. This is the only reason D-1 (shared Redis) exists.
+
+---
+
+### Layer 3 — Semaphore (counting, TTL-based self-healing)
+
+**What it does:** Limits how many workflows can be running concurrently for a single F5 device. If P-1 slots are all taken, new workers wait until one frees up. If a worker dies without releasing its slot, the TTL expires and the slot is automatically reclaimed.
+
+**Why it's needed separately from the queue depth:** The queue depth counter controls how many requests can be *waiting*. The semaphore controls how many can be *running simultaneously*. The F5 device has a finite config-write throughput (mcpd serialises config saves). Running 20 concurrent workflows against one device would overwhelm it even if the queue is within limits.
+
+**Where it lives:**
+- Implementation: `app/coordination/semaphore.py`
+- Lua scripts: `app/coordination/scripts/semaphore_acquire.lua`, `semaphore_release.lua`, `semaphore_renew.lua`
+- Used in: `app/workflow/engine.py::execute()` — wraps the entire workflow
+
+**Code — how the engine uses the semaphore (engine.py):**
+```python
+async with self._semaphore.slot(worker_id, timeout_seconds=self._semaphore_timeout):
+    # Slot is held here. If this block raises, slot is released in finally.
+    semaphore_slots_held.labels(device_id=device_id).inc()
+    heartbeat_task = asyncio.create_task(
+        self._run_heartbeat(req_repo, request_id, worker_id)
+    )
+    try:
+        await self._run_workflow(...)
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        semaphore_slots_held.labels(device_id=device_id).dec()
+```
+
+**How the TTL self-healing works:**
+1. Worker acquires slot → Redis Hash field `sem:{device_id}` gets field `worker_id = timestamp`, TTL = `slot_ttl` seconds
+2. Heartbeat background task calls `semaphore.renew(worker_id)` every P-5 seconds → resets TTL to `slot_ttl`
+3. If worker dies → heartbeat stops → TTL ticks down → slot expires automatically
+4. Other workers can now acquire that slot on their next poll
+
+**The critical invariant:** The heartbeat renews **both** `requests.last_heartbeat_at` in the DB **and** the semaphore slot TTL. The reclaim sweeper uses `last_heartbeat_at` to detect dead workers. The semaphore uses the TTL for the same purpose. They must stay in sync.
+
+```python
+# From engine.py _run_heartbeat():
+async def _run_heartbeat(self, req_repo, request_id, worker_id):
+    while True:
+        await asyncio.sleep(self._heartbeat_interval)
+        try:
+            req_repo.update_heartbeat(request_id)                      # DB
+            await self._semaphore.renew(worker_id, int(self._heartbeat_interval * 3))  # Redis
+        except Exception as exc:
+            log.warning("workflow.heartbeat_error", error=str(exc))
+```
+
+---
+
+### Layer 4 — Token bucket (per-device rate limiter)
+
+**What it does:** Limits the rate of HTTP calls to a specific F5 device. The semaphore limits *concurrent* workflows; the token bucket limits the *rate* of actual HTTP requests regardless of concurrency.
+
+**Why both?** If P-1 = 8 concurrent workflows and each workflow makes 10 F5 calls, that's 80 concurrent HTTP calls potentially. The token bucket smooths this to a rate the F5 control plane can sustain without saturating mcpd.
+
+**Algorithm:** Each "token" represents permission to make one HTTP call. Tokens refill at rate P-3 per second. Maximum bucket size is P-2 (burst ceiling). If the bucket is empty, the call is rejected immediately (not queued — that's Layer 3's job).
+
+**Where it lives:**
+- Implementation: `app/coordination/ratelimit.py`
+- Lua script: `app/coordination/scripts/token_bucket.lua`
+- Used in: `app/clients/f5/gtm.py::_consume_token()` — called before every HTTP call
+
+**Code — consume before every F5 HTTP call (gtm.py):**
+```python
+async def _consume_token(self) -> None:
+    if self._token_bucket is not None:
+        allowed = await self._token_bucket.consume(1)
+        if not allowed:
+            raise F5Error("Rate limit bucket exhausted — request rejected before F5 call")
+```
+
+**The Lua script does this atomically (token_bucket.lua sketch):**
+```lua
+-- args: capacity, refill_rate, tokens_requested, now
+local bucket = redis.call('HMGET', KEYS[1], 'tokens', 'last_refill')
+local tokens = tonumber(bucket[1]) or capacity
+local last_refill = tonumber(bucket[2]) or now
+
+-- refill based on elapsed time
+local elapsed = now - last_refill
+local new_tokens = math.min(capacity, tokens + elapsed * refill_rate)
+
+if new_tokens >= tokens_requested then
+    -- consume and update
+    redis.call('HMSET', KEYS[1], 'tokens', new_tokens - tokens_requested, 'last_refill', now)
+    return 1  -- allowed
+else
+    redis.call('HMSET', KEYS[1], 'tokens', new_tokens, 'last_refill', now)
+    return 0  -- rejected
+end
+```
+
+**Why Lua for all 4 layers?** Any of these operations that involves a read-then-write is a race condition if done in Python. For example: "check if tokens > 0, then decrement" — two pods doing this simultaneously can both see tokens > 0 and both decrement, exceeding the limit. Lua scripts run atomically inside Redis — no other command executes between the read and the write.
+
+---
+
+### How all 4 layers connect in one request lifecycle
+
+```
+POST /wideip arrives
+        │
+[app/api/routes.py]
+        ├─ Layer 1: read queue_depth:global and queue_depth:{device}  [admission.py]
+        ├─ Layer 2: peek circuit breaker state for device              [admission.py]
+        │
+        ├─ Atomic DB insert (unique index guard)
+        ├─ RECEIVED → QUEUED
+        ├─ run_gtm_workflow.delay(request_id, device_id)
+        ├─ Layer 1: INCR queue_depth:global, queue_depth:{device}     [routes.py]
+        └─ return 202
+
+[Celery worker picks up task]
+        │
+[app/tasks/workflows.py → app/workflow/engine.py]
+        │
+        ├─ Atomic DB claim: UPDATE WHERE status='QUEUED' AND request_id=?
+        │   (if 0 rows affected → another worker owns it → abort)
+        │
+        ├─ Layer 3: semaphore.slot(worker_id, timeout=P4)             [engine.py]
+        │   (if timeout → revert to QUEUED, re-enqueue)
+        │   (if acquired → hold slot until workflow completes)
+        │
+        ├─ Start heartbeat task (renews DB + semaphore TTL every P-5s)
+        │
+        ├─ For each step (monitor → pool → members → wideip → cname):
+        │   ├─ Layer 4: token_bucket.consume(1)                       [gtm.py]
+        │   │   (if empty → raise F5Error → step fails → rollback)
+        │   ├─ HTTP call to F5 or Infoblox
+        │   └─ Layer 2: record_success/failure/timeout on circuit breaker [gtm.py]
+        │
+        ├─ COMPLETED
+        ├─ Layer 1: DECR queue_depth:global, queue_depth:{device}     [engine.py]
+        └─ Layer 3: semaphore slot released in finally                 [engine.py]
+```
+
+---
+
+### Where to find each layer in the codebase
+
+| Layer | Core logic | Wiring point |
+|---|---|---|
+| Queue depth (L1) | `app/api/admission.py` (read) | `app/api/routes.py` (incr), `app/workflow/engine.py::_decrement_queue_depth()` (decr) |
+| Circuit breaker (L2) | `app/coordination/breaker.py` + `scripts/breaker_record.lua` | `app/api/admission.py` (read state), `app/clients/f5/gtm.py::_record_outcome()` (write outcomes) |
+| Semaphore (L3) | `app/coordination/semaphore.py` + `scripts/semaphore_*.lua` | `app/workflow/engine.py::execute()` (acquire/release), `engine.py::_run_heartbeat()` (renew) |
+| Token bucket (L4) | `app/coordination/ratelimit.py` + `scripts/token_bucket.lua` | `app/clients/f5/gtm.py::_consume_token()` (before every HTTP call) |
+
+---
+
 ## Key questions still open (do not assume answers)
 
 1. **TACACS+ source name on BIG-IP** — run `tmsh list auth tacacs` and set `F5_LOGIN_PROVIDER_NAME` to the object name shown.
