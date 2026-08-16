@@ -24,15 +24,114 @@ A full implementation plan at `docs/gtm-automation-implementation-plan.md` and a
 
 ---
 
-## Step 1 — Read everything before writing a single line
+## Step 1 — Read every file in this exact order before writing a single line
 
-Read in this order:
+Read each file listed below in sequence. The order matters: each layer builds on the one before it. For each file, the note tells you what to pay attention to — not just that it exists, but what decision or constraint it contains that will affect every file after it.
 
-1. `docs/gtm-automation-implementation-plan.md` — the authoritative spec
-2. `docs/api-research-findings.md` — confirmed F5 and Infoblox API shapes (do not invent anything not in this file)
-3. `docs/gap-analysis.md` — task-by-task status of what the scaffold has built and what remains
-4. Every file in `app/` — understand the scaffold before modifying it
-5. The existing app code (wherever it lives in this repo or is described to you) — understand what is already working in prod
+### Phase A — Understand the spec and what is confirmed
+
+| # | File | What to look for |
+|---|---|---|
+| A1 | `gtm-automation-implementation-plan.md` | The authoritative spec. Read §1 (locked decisions D-1 through D-11), §3 (full request flow), §5 (work packages and acceptance criteria), §9 (P-n parameter table). These decisions cannot be overridden. |
+| A2 | `docs/api-research-findings.md` | Every confirmed F5 and Infoblox endpoint, field name, and response shape for BIG-IP 17.1.x and WAPI 2.13. Only use what is in this file. If something you need is missing, write a `# TODO: confirm against F5 docs` comment. |
+| A3 | `docs/gap-analysis.md` | Task-by-task status: what the scaffold has built, what is partial, what is missing. Read this to avoid duplicating work and to know where to focus. |
+| A4 | `CLAUDE.md` | Project hard rules. Every rule here applies to every line you write. |
+
+### Phase B — Core: config and domain
+
+| # | File | What to look for |
+|---|---|---|
+| B1 | `app/core/config.py` | All P-n parameters. Every one is a placeholder (`-1` or `0.0`) with a `# TODO: awaiting T-0.x` comment. Note the field names exactly — other files import these by name. Note `F5_LOGIN_PROVIDER_NAME` (TACACS+), `F5_BIGIP_VERSION`, `get_device_config()`, `is_known_device()`. |
+| B2 | `app/domain/states.py` | The 15-state machine, `VALID_TRANSITIONS` dict, `transition()` guard, `TERMINAL_STATES`. Every status change in the codebase goes through `transition()`. |
+| B3 | `app/domain/models.py` | Domain object shapes. |
+| B4 | `app/core/logging.py` | How `request_id` is bound into every log line. |
+| B5 | `app/core/metrics.py` | The 18 Prometheus metrics. Note which ones are per-device (they take a `device_id` label). |
+
+### Phase C — Database layer
+
+| # | File | What to look for |
+|---|---|---|
+| C1 | `app/db/migrations/001_initial.sql` | The MSSQL DDL. Note `UX_requests_active_wip` — the partial unique index that prevents two active rows for the same `wip_fqdn`. Note the CHECK constraint on the 15 status values. **Ask for the actual production DDL before applying anything here — they may conflict.** |
+| C2 | `app/db/repositories.py` | Five repository classes: `RequestRepository`, `RequestStepRepository`, `ManagedObjectRepository`, `StateTransitionRepository`, `RemediationRepository`. All use raw pyodbc with parameterised queries. Note method signatures — the workflow engine calls these by name. |
+| C3 | `app/db/claim.py` | Two atomic operations: `atomic_insert_and_claim()` (API path — INSERT guarded by unique index) and `atomic_claim_queued()` (worker path — UPDATE WHERE status='QUEUED'). These are the two concurrency guards. Neither alone is sufficient. |
+
+### Phase D — Redis coordination layer (the 4 protection layers)
+
+Read these together. They implement the 4-layer protection system described later in this document.
+
+| # | File | What to look for |
+|---|---|---|
+| D1 | `app/coordination/exceptions.py` | `RedisUnavailableError` and `RedisOOMError`. Every Redis operation in the codebase raises one of these on failure. The API catches them and returns 503. |
+| D2 | `app/coordination/scripts/semaphore_acquire.lua` | Atomic slot acquisition: reads current slot count, grants if under `max_slots`, sets TTL. Returns 1 (granted) or 0 (full). |
+| D3 | `app/coordination/scripts/semaphore_release.lua` | Removes the worker's field from the semaphore Hash. |
+| D4 | `app/coordination/scripts/semaphore_renew.lua` | Resets the Hash TTL (heartbeat renewal). Returns 1 if field still exists. |
+| D5 | `app/coordination/semaphore.py` | `DeviceSemaphore`: `acquire()`, `release()`, `renew()`, and the `slot()` async context manager. Note that `slot()` always releases in `finally` — this is the guarantee the engine relies on. Key: `sem:{device_id}`. |
+| D6 | `app/coordination/scripts/token_bucket.lua` | Atomic token consume: computes refill since `last_refill`, checks if enough tokens exist, deducts if yes. Returns 1 (allowed) or 0 (rejected). |
+| D7 | `app/coordination/ratelimit.py` | `DeviceTokenBucket`: `consume()` and `wait_and_consume()`. Key: `bucket:{device_id}`. Note P-2 (capacity) and P-3 (refill_rate) are placeholder values. |
+| D8 | `app/coordination/scripts/breaker_record.lua` | Sliding-window state update: records success/failure/timeout, computes error rate and p95, transitions CLOSED→OPEN or OPEN→CLOSED as needed. |
+| D9 | `app/coordination/scripts/breaker_probe.lua` | Half-open probe: allows one request through, returns whether probing is allowed. |
+| D10 | `app/coordination/breaker.py` | `DeviceCircuitBreaker`: `record_success()`, `record_failure()`, `record_timeout()`, `get_state()`, `peek_state()`, `reset()`. Note P-10 parameters are placeholders. |
+
+### Phase E — External clients
+
+| # | File | What to look for |
+|---|---|---|
+| E1 | `app/clients/f5/session.py` | `F5Session`: one pooled httpx connection per device, keep-alive, timeouts. Note how `device_id` scopes the pool. |
+| E2 | `app/clients/f5/auth.py` | `F5TokenManager`: `get_token()` (cached in Redis, atomic stampede guard via NX lock), `_login_and_extend()` (sets token to 36000s lifetime via PATCH). Note `loginProviderName` is read from `self._login_provider_name` — **this must be set to the TACACS+ source name, not the default "tmos"**. |
+| E3 | `app/clients/f5/gtm.py` | `F5GTMClient`: all F5 calls — monitor, pool, pool_members, wideip. **Most important file in this phase.** Read `_consume_token()` (Layer 4 gate before every call) and `_record_outcome()` (feeds circuit breaker after every call). Read each object's `ensure_*` and `delete_*` methods — they follow the read→compare→act idempotency pattern. |
+| E4 | `app/clients/infoblox/session.py` | `InfobloxSession`: WAPI cookie reuse (`ibapauth`). |
+| E5 | `app/clients/infoblox/records.py` | `InfobloxClient`: `ensure_cname()` and `delete_cname()`. Fields: `name`, `canonical`. Read→compare→act pattern, same as F5 methods. |
+
+### Phase F — Workflow engine and steps
+
+| # | File | What to look for |
+|---|---|---|
+| F1 | `app/workflow/steps/base.py` | `StepProtocol` (also defined in engine.py) and `StepResult`. Every step returns a `StepResult(action, pre_state, post_state)`. Note `pre_state=None` means the object didn't exist before — rollback should delete it. `pre_state=dict` means it existed — rollback should restore it, never delete. |
+| F2 | `app/workflow/steps/monitor.py` | `MonitorStep`: `execute()` (read→compare→act for GTM monitor) and `compensate()` (rollback: None→delete, dict→restore). Read this one fully — the other steps follow the same pattern. |
+| F3 | `app/workflow/steps/pool.py` | `PoolStep` and `PoolMembersStep`. Same pattern. |
+| F4 | `app/workflow/steps/wideip.py` | `WideIPStep`. Same pattern. |
+| F5 | `app/workflow/steps/cname.py` | `CNAMEStep`: calls `InfobloxClient`, not `F5GTMClient`. Same pattern. |
+| F6 | `app/workflow/engine.py` | `WorkflowEngine.execute()` — the integration point for everything. Read the full method sequence: atomic DB claim → semaphore slot (with timing) → heartbeat background task → steps loop → rollback on failure → `_decrement_queue_depth()` on terminal state. Note how `_run_heartbeat()` renews both the DB row and the semaphore TTL. |
+
+### Phase G — API layer
+
+| # | File | What to look for |
+|---|---|---|
+| G1 | `app/api/schemas.py` | `WideIPRequest`, `WideIPResponse`, `StatusResponse`, `ErrorResponse`, `GTMAction` enum. |
+| G2 | `app/api/idempotency.py` | `compute_idempotency_key()` — sha256 of normalised (sorted keys, lowercased FQDNs, stripped whitespace) payload. |
+| G3 | `app/api/admission.py` | `run_admission_checks()` — the 4-step funnel in cheapest-first order: Redis reachable? → kill switch? → global queue depth (reads `queue_depth:global`)? → device breaker or device queue depth (reads `queue_depth:{device_id}`)? Returns `AdmissionResult(allowed, status_code, retry_after, error)`. |
+| G4 | `app/api/routes.py` | The 4 route handlers and `_handle_request()`. Note the INCR of `queue_depth:global` and `queue_depth:{device_id}` after `.delay()`. Note the idempotency replay (same key → 200) and conflict (different key → 409) handling. |
+| G5 | `app/api/notifications.py` | `GET /api/v1/notifications?since={ISO timestamp}`. Polling endpoint called every 1 minute by consuming apps. Returns `needs_attention`, `rollback_failed`, `open_breakers`, `remediation_escalated`, `summary`. |
+| G6 | `app/main.py` | FastAPI app setup, lifespan (Redis and DB pool init/teardown), middleware, router registration. |
+
+### Phase H — Celery tasks
+
+| # | File | What to look for |
+|---|---|---|
+| H1 | `app/tasks/celery_app.py` | Celery config: `task_ignore_result=True`, `worker_prefetch_multiplier=1`. Note how Redis OOM is handled (must return 503, not 500). |
+| H2 | `app/tasks/workflows.py` | `_build_engine_for_device()` — the composition root. This is where every dependency (F5 session, auth, token bucket, breaker, semaphore, controls, DB factory) is constructed and injected into `WorkflowEngine`. Read this fully — it shows how all modules connect. Note `engine._redis_client = redis_client` at the bottom (injected for queue depth decrement). Also note the bug at line 76: `circuit_breaker=breaker` references `breaker` before it is defined — this needs to be fixed. |
+| H3 | `app/tasks/beat.py` | Scheduled tasks: reclaim sweeper, remediation worker, reconciler. |
+
+### Phase I — Recovery
+
+| # | File | What to look for |
+|---|---|---|
+| I1 | `app/recovery/reclaim.py` | `WorkerReclaimer` — two-pass: (1) stale RUNNING rows where `last_heartbeat_at` is older than P-6; (2) orphaned QUEUED rows. Note: a RUNNING row with a healthy heartbeat is **never** reclaimed — reclaiming it would produce two concurrent writers on the same WideIP. |
+| I2 | `app/recovery/remediation.py` | `RemediationWorker` — exponential backoff retry with jitter, escalates to NEEDS_ATTENTION after MAX_ATTEMPTS. |
+| I3 | `app/recovery/reconciler.py` | `Reconciler` — `write_enabled=False` is checked at construction and raises immediately if True (D-10 absolute). Report-only drift detection. |
+
+### Phase J — Operational controls
+
+| # | File | What to look for |
+|---|---|---|
+| J1 | `app/ops/controls.py` | `OperationalControls`: `is_kill_switch_active()`, `is_dry_run()`, `is_delete_allowed()`, `is_device_enabled()`. All live in Redis. All checked at runtime — no redeploy needed to toggle. |
+| J2 | `app/ops/status.py` | Full system health snapshot: breaker states, queue depths, slot utilisation, kill-switch/dry-run state, remediation depth. |
+
+### Phase K — Known bug to fix before anything else
+
+| File | Bug | Fix |
+|---|---|---|
+| `app/tasks/workflows.py` line ~76 | `circuit_breaker=breaker` passes `breaker` to `F5GTMClient` before `breaker` is defined (it is defined at line ~97). | Move the `breaker = DeviceCircuitBreaker(...)` block to before the `f5_client = F5GTMClient(...)` block, or restructure the ordering. |
 
 ---
 
